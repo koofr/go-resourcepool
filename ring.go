@@ -1,4 +1,4 @@
-package pools
+package resourcepool
 
 type ring struct {
 	cnt, i int

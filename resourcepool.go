@@ -1,4 +1,4 @@
-package pools
+package resourcepool
 
 import (
 	"errors"
