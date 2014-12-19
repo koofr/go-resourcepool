@@ -21,6 +21,7 @@ type ResourcePool struct {
 	acqchan chan acquireMessage
 	rchan   chan releaseMessage
 	cchan   chan closeMessage
+	echan   chan emptyMessage
 
 	activeWaits []acquireMessage
 }
@@ -38,6 +39,7 @@ func NewResourcePool(factory Factory, idleCapacity, maxResources int) (rp *Resou
 		acqchan: make(chan acquireMessage),
 		rchan:   make(chan releaseMessage, 1),
 		cchan:   make(chan closeMessage, 1),
+		echan:   make(chan emptyMessage, 1),
 	}
 
 	go rp.mux()
@@ -55,6 +57,9 @@ type acquireMessage struct {
 }
 
 type closeMessage struct {
+}
+
+type emptyMessage struct {
 }
 
 func (rp *ResourcePool) mux() {
@@ -87,6 +92,11 @@ loop:
 
 		case _ = <-rp.cchan:
 			break loop
+
+		case _ = <-rp.echan:
+			for !rp.idleResources.Empty() {
+				rp.idleResources.Dequeue().Close()
+			}
 		}
 	}
 	for !rp.idleResources.Empty() {
@@ -164,9 +174,14 @@ func (rp *ResourcePool) Release(resource Resource) {
 	rp.rchan <- rel
 }
 
-// Close() closes all the pools resources.
+// Close() closes all the pool's resources.
 func (rp *ResourcePool) Close() {
 	rp.cchan <- closeMessage{}
+}
+
+// Empty() removes idle pool's resources.
+func (rp *ResourcePool) Empty() {
+	rp.echan <- emptyMessage{}
 }
 
 // NumResources() the number of resources known at this time
