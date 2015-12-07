@@ -90,9 +90,7 @@ loop:
 			break loop
 
 		case _ = <-rp.echan:
-			for !rp.idleResources.Empty() {
-				rp.idleResources.Dequeue().Close()
-			}
+			rp.empty()
 		}
 	}
 	for !rp.idleResources.Empty() {
@@ -143,6 +141,13 @@ func (rp *ResourcePool) release(resource Resource) {
 	}
 
 	rp.idleResources.Enqueue(resource)
+}
+
+func (rp *ResourcePool) empty() {
+	for !rp.idleResources.Empty() {
+		rp.idleResources.Dequeue().Close()
+		rp.numResources -= 1
+	}
 }
 
 // Acquire() will get one of the idle resources, or create a new one.
