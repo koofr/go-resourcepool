@@ -2,7 +2,10 @@ package resourcepool
 
 import (
 	"errors"
+	"sync"
 )
+
+var PoolClosed = errors.New("Resource pool closed")
 
 type Resource interface {
 	Close()
@@ -12,11 +15,13 @@ type Resource interface {
 type Factory func() (Resource, error)
 
 type ResourcePool struct {
-	factory       Factory
-	idleResources ring
-	idleCapacity  int
-	maxResources  int
-	numResources  int
+	factory                 Factory
+	idleResources           ring
+	idleCapacity            int
+	maxResources            int
+	numResources            int
+	closed                  bool
+	numResourcesClosedMutex sync.Mutex
 
 	acqchan chan acquireMessage
 	rchan   chan releaseMessage
@@ -31,6 +36,7 @@ func NewResourcePool(factory Factory, idleCapacity, maxResources int) (rp *Resou
 		factory:      factory,
 		idleCapacity: idleCapacity,
 		maxResources: maxResources,
+		closed:       false,
 
 		acqchan: make(chan acquireMessage),
 		rchan:   make(chan releaseMessage, 1),
@@ -93,12 +99,12 @@ loop:
 			rp.empty()
 		}
 	}
-	for !rp.idleResources.Empty() {
-		rp.idleResources.Dequeue().Close()
-	}
+	rp.empty()
+	rp.closed = true
 	for _, aw := range rp.activeWaits {
-		aw.ech <- errors.New("Resource pool closed")
+		aw.ech <- PoolClosed
 	}
+	rp.activeWaits = []acquireMessage{}
 }
 
 func (rp *ResourcePool) acquire(acq acquireMessage) {
@@ -152,6 +158,9 @@ func (rp *ResourcePool) empty() {
 
 // Acquire() will get one of the idle resources, or create a new one.
 func (rp *ResourcePool) Acquire() (resource Resource, err error) {
+	if rp.closed {
+		return nil, PoolClosed
+	}
 	acq := acquireMessage{
 		rch: make(chan Resource),
 		ech: make(chan error),
@@ -169,6 +178,17 @@ func (rp *ResourcePool) Acquire() (resource Resource, err error) {
 // Release() will release a resource for use by others. If the idle queue is
 // full, the resource will be closed.
 func (rp *ResourcePool) Release(resource Resource) {
+	if rp.closed {
+		if !resource.IsClosed() {
+			resource.Close()
+		}
+
+		rp.numResourcesClosedMutex.Lock()
+		rp.numResources -= 1
+		rp.numResourcesClosedMutex.Unlock()
+
+		return
+	}
 	rel := releaseMessage{
 		r: resource,
 	}
@@ -177,11 +197,17 @@ func (rp *ResourcePool) Release(resource Resource) {
 
 // Close() closes all the pool's resources.
 func (rp *ResourcePool) Close() {
+	if rp.closed {
+		return
+	}
 	rp.cchan <- closeMessage{}
 }
 
 // Empty() removes idle pool's resources.
 func (rp *ResourcePool) Empty() {
+	if rp.closed {
+		return
+	}
 	rp.echan <- emptyMessage{}
 }
 
