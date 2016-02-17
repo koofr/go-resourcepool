@@ -89,6 +89,7 @@ var _ = Describe("ResourcePool", func() {
 
 			pool.Release(r)
 			runtime.Gosched()
+			runtime.Gosched()
 
 			Expect(pool.numResources).To(Equal(0))
 			Expect(pool.idleResources.Size()).To(Equal(0))
@@ -121,6 +122,7 @@ var _ = Describe("ResourcePool", func() {
 
 			pool.Release(r)
 			runtime.Gosched()
+			runtime.Gosched()
 
 			Expect(pool.numResources).To(Equal(1))
 			Expect(pool.idleResources.Size()).To(Equal(1))
@@ -140,6 +142,7 @@ var _ = Describe("ResourcePool", func() {
 
 			pool.Release(r)
 			runtime.Gosched()
+			runtime.Gosched()
 
 			Expect(pool.numResources).To(Equal(0))
 			Expect(pool.idleResources.Size()).To(Equal(0))
@@ -154,6 +157,7 @@ var _ = Describe("ResourcePool", func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			pool.Release(r)
+			runtime.Gosched()
 			runtime.Gosched()
 
 			Expect(pool.numResources).To(Equal(1))
@@ -171,6 +175,7 @@ var _ = Describe("ResourcePool", func() {
 
 			pool.Release(r)
 			runtime.Gosched()
+			runtime.Gosched()
 
 			Expect(pool.numResources).To(Equal(1))
 			Expect(pool.idleResources.Size()).To(Equal(1))
@@ -186,6 +191,7 @@ var _ = Describe("ResourcePool", func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			pool.Release(r)
+			runtime.Gosched()
 			runtime.Gosched()
 
 			Expect(pool.numResources).To(Equal(1))
@@ -204,6 +210,7 @@ var _ = Describe("ResourcePool", func() {
 			Expect(active).To(Equal(1))
 
 			pool.Release(r)
+			runtime.Gosched()
 			runtime.Gosched()
 
 			Expect(pool.numResources).To(Equal(1))
@@ -245,6 +252,7 @@ var _ = Describe("ResourcePool", func() {
 
 			pool.Release(r)
 			runtime.Gosched()
+			runtime.Gosched()
 
 			Expect(pool.numResources).To(Equal(1))
 			Expect(pool.idleResources.Size()).To(Equal(0))
@@ -253,6 +261,7 @@ var _ = Describe("ResourcePool", func() {
 			Expect(acquired).To(BeTrue())
 
 			pool.Release(newR)
+			runtime.Gosched()
 			runtime.Gosched()
 
 			Expect(pool.numResources).To(Equal(1))
@@ -297,6 +306,7 @@ var _ = Describe("ResourcePool", func() {
 			r.Close()
 			pool.Release(r)
 			runtime.Gosched()
+			runtime.Gosched()
 
 			Expect(pool.numResources).To(Equal(1))
 			Expect(pool.idleResources.Size()).To(Equal(0))
@@ -306,6 +316,7 @@ var _ = Describe("ResourcePool", func() {
 			Expect(acquired).To(BeTrue())
 
 			pool.Release(newR)
+			runtime.Gosched()
 			runtime.Gosched()
 
 			Expect(pool.numResources).To(Equal(1))
@@ -360,6 +371,7 @@ var _ = Describe("ResourcePool", func() {
 			r.Close()
 			pool.Release(r)
 			runtime.Gosched()
+			runtime.Gosched()
 
 			Expect(pool.numResources).To(Equal(0))
 			Expect(pool.idleResources.Size()).To(Equal(0))
@@ -413,6 +425,7 @@ var _ = Describe("ResourcePool", func() {
 
 			pool.Release(r)
 			runtime.Gosched()
+			runtime.Gosched()
 
 			Expect(acquired).To(BeTrue())
 
@@ -435,6 +448,7 @@ var _ = Describe("ResourcePool", func() {
 
 			pool.Release(r)
 			runtime.Gosched()
+			runtime.Gosched()
 
 			Expect(pool.numResources).To(Equal(2))
 			Expect(pool.idleResources.Size()).To(Equal(1))
@@ -450,6 +464,7 @@ var _ = Describe("ResourcePool", func() {
 			r1.Close()
 			pool.Release(r1)
 			runtime.Gosched()
+			runtime.Gosched()
 
 			Expect(pool.numResources).To(Equal(0))
 			Expect(pool.idleResources.Size()).To(Equal(0))
@@ -463,6 +478,7 @@ var _ = Describe("ResourcePool", func() {
 			Expect(active).To(Equal(1))
 
 			pool.Release(r)
+			runtime.Gosched()
 			runtime.Gosched()
 
 			Expect(pool.numResources).To(Equal(1))
@@ -491,6 +507,7 @@ var _ = Describe("ResourcePool", func() {
 
 			pool.Release(r)
 			runtime.Gosched()
+			runtime.Gosched()
 
 			Expect(pool.numResources).To(Equal(1))
 			Expect(pool.idleResources.Size()).To(Equal(1))
@@ -514,6 +531,7 @@ var _ = Describe("ResourcePool", func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			pool.Release(r)
+			runtime.Gosched()
 			runtime.Gosched()
 
 			Expect(pool.numResources).To(Equal(1))
