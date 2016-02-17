@@ -496,6 +496,59 @@ var _ = Describe("ResourcePool", func() {
 			pool.Empty()
 			runtime.Gosched()
 		})
+
+		It("should empty the pool before acquires", func() {
+			for j := 0; j < 10; j++ {
+				func() {
+					created = 0
+					active = 0
+
+					pool := NewResourcePool(factory, 10, 20)
+					defer pool.Close()
+
+					rs := make([]Resource, 10)
+
+					for i, _ := range rs {
+						r, err := pool.Acquire()
+						Expect(err).NotTo(HaveOccurred())
+						rs[i] = r
+					}
+
+					for i, _ := range rs {
+						pool.Release(rs[i])
+					}
+
+					runtime.Gosched()
+					runtime.Gosched()
+
+					Expect(pool.numResources).To(Equal(10))
+					Expect(pool.idleResources.Size()).To(Equal(10))
+					Expect(active).To(Equal(10))
+					Expect(created).To(Equal(10))
+
+					for i := 0; i < 10; i++ {
+						r, err := pool.Acquire()
+						Expect(err).NotTo(HaveOccurred())
+
+						r.Close()
+
+						pool.Release(r)
+
+						pool.Empty()
+					}
+
+					Expect(active).To(Equal(0))
+					Expect(created).To(Equal(19))
+
+					pool.Empty()
+					runtime.Gosched()
+
+					Expect(pool.numResources).To(Equal(0))
+					Expect(pool.idleResources.Size()).To(Equal(0))
+					Expect(active).To(Equal(0))
+				}()
+			}
+		})
 	})
 
 	Describe("Close", func() {

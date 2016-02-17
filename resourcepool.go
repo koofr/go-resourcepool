@@ -63,6 +63,7 @@ type closeMessage struct {
 }
 
 type emptyMessage struct {
+	rch chan interface{}
 }
 
 func (rp *ResourcePool) mux() {
@@ -71,6 +72,7 @@ loop:
 		select {
 		case acq := <-rp.acqchan:
 			rp.acquire(acq)
+
 		case rel := <-rp.rchan:
 			if len(rp.activeWaits) != 0 {
 				// someone is waiting - give them the resource if we can
@@ -96,8 +98,20 @@ loop:
 		case _ = <-rp.cchan:
 			break loop
 
-		case _ = <-rp.echan:
+		case emp := <-rp.echan:
 			rp.empty()
+			emp.rch <- nil
+
+			// drain the empty channel
+		drainloop:
+			for {
+				select {
+				case e := <-rp.echan:
+					e.rch <- nil
+				default:
+					break drainloop
+				}
+			}
 		}
 	}
 
@@ -223,7 +237,14 @@ func (rp *ResourcePool) Empty() {
 	if rp.IsClosed() {
 		return
 	}
-	rp.echan <- emptyMessage{}
+
+	emp := emptyMessage{
+		rch: make(chan interface{}),
+	}
+
+	rp.echan <- emp
+
+	<-emp.rch
 }
 
 // NumResources() the number of resources known at this time
