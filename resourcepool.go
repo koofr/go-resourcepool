@@ -21,6 +21,7 @@ type ResourcePool struct {
 	maxResources            int
 	numResources            int
 	closed                  bool
+	closedMutex             sync.RWMutex
 	numResourcesClosedMutex sync.Mutex
 
 	acqchan chan acquireMessage
@@ -99,11 +100,17 @@ loop:
 			rp.empty()
 		}
 	}
+
 	rp.empty()
+
+	rp.closedMutex.Lock()
 	rp.closed = true
+	rp.closedMutex.Unlock()
+
 	for _, aw := range rp.activeWaits {
 		aw.ech <- PoolClosed
 	}
+
 	rp.activeWaits = []acquireMessage{}
 }
 
@@ -156,11 +163,19 @@ func (rp *ResourcePool) empty() {
 	}
 }
 
+func (rp *ResourcePool) IsClosed() bool {
+	rp.closedMutex.RLock()
+	defer rp.closedMutex.RUnlock()
+
+	return rp.closed
+}
+
 // Acquire() will get one of the idle resources, or create a new one.
 func (rp *ResourcePool) Acquire() (resource Resource, err error) {
-	if rp.closed {
+	if rp.IsClosed() {
 		return nil, PoolClosed
 	}
+
 	acq := acquireMessage{
 		rch: make(chan Resource),
 		ech: make(chan error),
@@ -178,7 +193,7 @@ func (rp *ResourcePool) Acquire() (resource Resource, err error) {
 // Release() will release a resource for use by others. If the idle queue is
 // full, the resource will be closed.
 func (rp *ResourcePool) Release(resource Resource) {
-	if rp.closed {
+	if rp.IsClosed() {
 		if !resource.IsClosed() {
 			resource.Close()
 		}
@@ -197,7 +212,7 @@ func (rp *ResourcePool) Release(resource Resource) {
 
 // Close() closes all the pool's resources.
 func (rp *ResourcePool) Close() {
-	if rp.closed {
+	if rp.IsClosed() {
 		return
 	}
 	rp.cchan <- closeMessage{}
@@ -205,7 +220,7 @@ func (rp *ResourcePool) Close() {
 
 // Empty() removes idle pool's resources.
 func (rp *ResourcePool) Empty() {
-	if rp.closed {
+	if rp.IsClosed() {
 		return
 	}
 	rp.echan <- emptyMessage{}
