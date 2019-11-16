@@ -1,500 +1,784 @@
 package resourcepool
 
 import (
+	"context"
 	"errors"
-	"runtime"
-	"sync"
+	"sync/atomic"
+	"time"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
 
-var created = 0
-var active = 0
-var activeMutex sync.Mutex
+var created int64
+var active int64
 
-type testresource struct {
-	closed bool
+func getCreated() int {
+	return int(atomic.LoadInt64(&created))
 }
 
-func NewTestresource() *testresource {
-	activeMutex.Lock()
-	defer activeMutex.Unlock()
-	active += 1
-	created += 1
+func getActive() int {
+	return int(atomic.LoadInt64(&active))
+}
 
-	return &testresource{false}
+type testresource struct {
+	closed     bool
+	onClose    func()
+	onIsClosed func()
+}
+
+func newTestresource() *testresource {
+	atomic.AddInt64(&active, 1)
+	atomic.AddInt64(&created, 1)
+
+	return &testresource{
+		closed: false,
+	}
 }
 
 func (r *testresource) Close() {
-	activeMutex.Lock()
-	defer activeMutex.Unlock()
-	active -= 1
+	if r.onClose != nil {
+		r.onClose()
+	}
+
+	atomic.AddInt64(&active, -1)
 
 	r.closed = true
 }
 
 func (r *testresource) IsClosed() bool {
+	if r.onIsClosed != nil {
+		r.onIsClosed()
+	}
 	return r.closed
 }
 
-func factory() (Resource, error) {
-	return NewTestresource(), nil
+func factory(ctx context.Context) (Resource, error) {
+	return newTestresource(), nil
 }
 
 var _ = Describe("ResourcePool", func() {
-	runtime.GOMAXPROCS(1)
+	var idleCapacity int
+	var maxResources int
+	var currentFactory Factory
+	var pool *ResourcePool
 
 	BeforeEach(func() {
 		created = 0
-		Expect(active).To(Equal(0))
+		active = 0
 	})
 
 	AfterEach(func() {
-		Expect(active).To(Equal(0))
+		Eventually(getActive).Should(Equal(0))
 	})
 
-	var closePool = func(pool *ResourcePool) {
+	createPool := func(factory Factory, createIdleCapacity int, createMaxResources int) {
+		currentFactory = factory
+		idleCapacity = createIdleCapacity
+		maxResources = createMaxResources
+		pool = NewResourcePool(func(ctx context.Context) (Resource, error) {
+			return currentFactory(ctx)
+		}, idleCapacity, maxResources)
+	}
+
+	closePool := func() {
 		pool.Close()
-		runtime.Gosched()
 	}
 
 	It("should create new pool", func() {
-		pool := NewResourcePool(factory, 2, 10)
-		defer pool.Close()
+		createPool(factory, 2, 10)
+		defer closePool()
 
-		Expect(pool.idleCapacity).To(Equal(2))
-		Expect(pool.maxResources).To(Equal(10))
-
-		Expect(pool.numResources).To(Equal(0))
-		Expect(pool.idleResources.Size()).To(Equal(0))
-		Expect(active).To(Equal(0))
+		Expect(pool.NumResources()).To(Equal(0))
+		Expect(pool.NumIdleResources()).To(Equal(0))
+		Expect(getActive()).To(Equal(0))
 	})
 
 	Describe("Acquire", func() {
 		It("should acquire new resource", func() {
-			pool := NewResourcePool(factory, 2, 10)
-			defer closePool(pool)
+			createPool(factory, 2, 10)
+			defer closePool()
 
-			r, err := pool.Acquire()
+			r, err := pool.Acquire(context.Background())
 			Expect(err).NotTo(HaveOccurred())
 
-			Expect(pool.numResources).To(Equal(1))
-			Expect(active).To(Equal(1))
+			Eventually(pool.NumResources).Should(Equal(1))
+			Eventually(getActive).Should(Equal(1))
 
 			r.Close()
-			Expect(active).To(Equal(0))
+			Eventually(getActive).Should(Equal(0))
 
-			Expect(pool.numResources).To(Equal(1))
+			Eventually(pool.NumResources).Should(Equal(1))
 
 			pool.Release(r)
-			runtime.Gosched()
-			runtime.Gosched()
 
-			Expect(pool.numResources).To(Equal(0))
-			Expect(pool.idleResources.Size()).To(Equal(0))
+			Eventually(pool.NumResources).Should(Equal(0))
+			Eventually(pool.NumIdleResources).Should(Equal(0))
 		})
 
 		It("should not acquire new resource", func() {
-			myfactory := func() (Resource, error) {
+			myfactory := func(ctx context.Context) (Resource, error) {
 				return nil, errors.New("could not create new resource")
 			}
 
-			pool := NewResourcePool(myfactory, 2, 10)
-			defer closePool(pool)
+			createPool(myfactory, 2, 10)
+			defer closePool()
 
-			_, err := pool.Acquire()
+			_, err := pool.Acquire(context.Background())
 			Expect(err).To(HaveOccurred())
 
-			Expect(pool.numResources).To(Equal(0))
+			Eventually(pool.NumResources).Should(Equal(0))
 		})
 
 		It("should acquire new resource and keep it idle", func() {
-			pool := NewResourcePool(factory, 2, 10)
-			defer closePool(pool)
+			createPool(factory, 2, 10)
+			defer closePool()
 
-			r, err := pool.Acquire()
+			r, err := pool.Acquire(context.Background())
 			Expect(err).NotTo(HaveOccurred())
 
-			Expect(pool.numResources).To(Equal(1))
-			Expect(pool.idleResources.Size()).To(Equal(0))
-			Expect(active).To(Equal(1))
+			Eventually(pool.NumResources).Should(Equal(1))
+			Eventually(pool.NumIdleResources).Should(Equal(0))
+			Eventually(getActive).Should(Equal(1))
 
 			pool.Release(r)
-			runtime.Gosched()
-			runtime.Gosched()
 
-			Expect(pool.numResources).To(Equal(1))
-			Expect(pool.idleResources.Size()).To(Equal(1))
-			Expect(active).To(Equal(1))
+			Eventually(pool.NumResources).Should(Equal(1))
+			Eventually(pool.NumIdleResources).Should(Equal(1))
+			Eventually(getActive).Should(Equal(1))
 		})
 
 		It("should acquire new resource and release it", func() {
-			pool := NewResourcePool(factory, 0, 10)
-			defer closePool(pool)
+			createPool(factory, 0, 10)
+			defer closePool()
 
-			r, err := pool.Acquire()
+			r, err := pool.Acquire(context.Background())
 			Expect(err).NotTo(HaveOccurred())
 
-			Expect(pool.numResources).To(Equal(1))
-			Expect(pool.idleResources.Size()).To(Equal(0))
-			Expect(active).To(Equal(1))
+			Eventually(pool.NumResources).Should(Equal(1))
+			Eventually(pool.NumIdleResources).Should(Equal(0))
+			Eventually(getActive).Should(Equal(1))
 
 			pool.Release(r)
-			runtime.Gosched()
-			runtime.Gosched()
 
-			Expect(pool.numResources).To(Equal(0))
-			Expect(pool.idleResources.Size()).To(Equal(0))
-			Expect(active).To(Equal(0))
+			Eventually(pool.NumResources).Should(Equal(0))
+			Eventually(pool.NumIdleResources).Should(Equal(0))
+			Eventually(getActive).Should(Equal(0))
 		})
 
 		It("should acquire resource from idle pool", func() {
-			pool := NewResourcePool(factory, 2, 10)
-			defer closePool(pool)
+			createPool(factory, 2, 10)
+			defer closePool()
 
-			r, err := pool.Acquire()
+			r, err := pool.Acquire(context.Background())
 			Expect(err).NotTo(HaveOccurred())
 
 			pool.Release(r)
-			runtime.Gosched()
-			runtime.Gosched()
 
-			Expect(pool.numResources).To(Equal(1))
-			Expect(pool.idleResources.Size()).To(Equal(1))
-			Expect(created).To(Equal(1))
-			Expect(active).To(Equal(1))
+			Eventually(pool.NumResources).Should(Equal(1))
+			Eventually(pool.NumIdleResources).Should(Equal(1))
+			Eventually(getCreated).Should(Equal(1))
+			Eventually(getActive).Should(Equal(1))
 
-			r, err = pool.Acquire()
+			r, err = pool.Acquire(context.Background())
 			Expect(err).NotTo(HaveOccurred())
 
-			Expect(pool.numResources).To(Equal(1))
-			Expect(pool.idleResources.Size()).To(Equal(0))
-			Expect(created).To(Equal(1))
-			Expect(active).To(Equal(1))
+			Eventually(pool.NumResources).Should(Equal(1))
+			Eventually(pool.NumIdleResources).Should(Equal(0))
+			Eventually(getCreated).Should(Equal(1))
+			Eventually(getActive).Should(Equal(1))
 
 			pool.Release(r)
-			runtime.Gosched()
-			runtime.Gosched()
 
-			Expect(pool.numResources).To(Equal(1))
-			Expect(pool.idleResources.Size()).To(Equal(1))
-			Expect(created).To(Equal(1))
-			Expect(active).To(Equal(1))
+			Eventually(pool.NumResources).Should(Equal(1))
+			Eventually(pool.NumIdleResources).Should(Equal(1))
+			Eventually(getCreated).Should(Equal(1))
+			Eventually(getActive).Should(Equal(1))
+		})
+
+		It("should acquire resource from idle pool (already canceled context)", func() {
+			createPool(factory, 2, 10)
+			defer closePool()
+
+			r, err := pool.Acquire(context.Background())
+			Expect(err).NotTo(HaveOccurred())
+
+			pool.Release(r)
+
+			Eventually(pool.NumResources).Should(Equal(1))
+			Eventually(pool.NumIdleResources).Should(Equal(1))
+			Eventually(getCreated).Should(Equal(1))
+			Eventually(getActive).Should(Equal(1))
+
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			_, err = pool.Acquire(ctx)
+			Expect(err).To(HaveOccurred())
+			Expect(err).To(Equal(context.Canceled))
+
+			Eventually(pool.NumResources).Should(Equal(1))
+			Eventually(pool.NumIdleResources).Should(Equal(1))
+			Eventually(getCreated).Should(Equal(1))
+			Eventually(getActive).Should(Equal(1))
+		})
+
+		It("should acquire resource from idle pool (canceled while waiting for acquire chan)", func() {
+			isAcquiring := make(chan interface{})
+			isCanceled := make(chan interface{})
+
+			ctx, cancel := context.WithCancel(context.Background())
+
+			createPool(func(ctx context.Context) (Resource, error) {
+				isAcquiring <- nil
+				time.Sleep(100 * time.Millisecond)
+				cancel()
+				<-isCanceled
+				isAcquiring <- nil
+				return factory(ctx)
+			}, 2, 10)
+			defer closePool()
+
+			go func() {
+				defer GinkgoRecover()
+				r, err := pool.Acquire(context.Background())
+				Expect(err).NotTo(HaveOccurred())
+				pool.Release(r)
+			}()
+
+			<-isAcquiring
+
+			_, err := pool.Acquire(ctx)
+			Expect(err).To(HaveOccurred())
+			Expect(err).To(Equal(context.Canceled))
+
+			isCanceled <- nil
+			<-isAcquiring
+		})
+
+		It("should acquire resource from idle pool (canceled while acquiring)", func() {
+			createPool(factory, 2, 10)
+			defer closePool()
+
+			r, err := pool.Acquire(context.Background())
+			Expect(err).NotTo(HaveOccurred())
+
+			pool.Release(r)
+
+			Eventually(pool.NumResources).Should(Equal(1))
+			Eventually(pool.NumIdleResources).Should(Equal(1))
+			Eventually(getCreated).Should(Equal(1))
+			Eventually(getActive).Should(Equal(1))
+
+			ctx, cancel := context.WithCancel(context.Background())
+
+			r.(*testresource).onIsClosed = func() {
+				cancel()
+			}
+
+			_, err = pool.Acquire(ctx)
+			Expect(err).To(HaveOccurred())
+			Expect(err).To(Equal(context.Canceled))
+
+			Eventually(pool.NumResources).Should(Equal(1))
+			Eventually(pool.NumIdleResources).Should(Equal(1))
+			Eventually(getCreated).Should(Equal(1))
+			Eventually(getActive).Should(Equal(1))
 		})
 
 		It("should acquire resource from idle pool and create new one", func() {
-			pool := NewResourcePool(factory, 2, 10)
-			defer closePool(pool)
+			createPool(factory, 2, 10)
+			defer closePool()
 
-			r, err := pool.Acquire()
+			r, err := pool.Acquire(context.Background())
 			Expect(err).NotTo(HaveOccurred())
 
 			pool.Release(r)
-			runtime.Gosched()
-			runtime.Gosched()
 
-			Expect(pool.numResources).To(Equal(1))
-			Expect(pool.idleResources.Size()).To(Equal(1))
-			Expect(created).To(Equal(1))
-			Expect(active).To(Equal(1))
+			Eventually(pool.NumResources).Should(Equal(1))
+			Eventually(pool.NumIdleResources).Should(Equal(1))
+			Eventually(getCreated).Should(Equal(1))
+			Eventually(getActive).Should(Equal(1))
 
 			r.Close()
 
-			r, err = pool.Acquire()
+			r, err = pool.Acquire(context.Background())
 			Expect(err).NotTo(HaveOccurred())
 
-			Expect(pool.numResources).To(Equal(1))
-			Expect(pool.idleResources.Size()).To(Equal(0))
-			Expect(created).To(Equal(2))
-			Expect(active).To(Equal(1))
+			Eventually(pool.NumResources).Should(Equal(1))
+			Eventually(pool.NumIdleResources).Should(Equal(0))
+			Eventually(getCreated).Should(Equal(2))
+			Eventually(getActive).Should(Equal(1))
 
 			pool.Release(r)
-			runtime.Gosched()
-			runtime.Gosched()
 
-			Expect(pool.numResources).To(Equal(1))
-			Expect(pool.idleResources.Size()).To(Equal(1))
-			Expect(created).To(Equal(2))
-			Expect(active).To(Equal(1))
+			Eventually(pool.NumResources).Should(Equal(1))
+			Eventually(pool.NumIdleResources).Should(Equal(1))
+			Eventually(getCreated).Should(Equal(2))
+			Eventually(getActive).Should(Equal(1))
 		})
 
 		It("should wait for available resource", func() {
-			pool := NewResourcePool(factory, 1, 1)
-			defer closePool(pool)
+			createPool(factory, 1, 1)
+			defer closePool()
 
-			r, err := pool.Acquire()
+			r, err := pool.Acquire(context.Background())
 			Expect(err).NotTo(HaveOccurred())
 
-			Expect(pool.numResources).To(Equal(1))
-			Expect(pool.idleResources.Size()).To(Equal(0))
-			Expect(active).To(Equal(1))
+			Eventually(pool.NumResources).Should(Equal(1))
+			Eventually(pool.NumIdleResources).Should(Equal(0))
+			Eventually(getActive).Should(Equal(1))
 
-			waiting := false
-			acquired := false
-			var newR Resource
+			waiting := make(chan interface{}, 1)
+			acquired := make(chan interface{}, 1)
+
+			newResourceChan := make(chan Resource)
 
 			go func() {
-				waiting = true
+				defer GinkgoRecover()
 
-				r, err := pool.Acquire()
+				waiting <- nil
+
+				r, err := pool.Acquire(context.Background())
 				Expect(err).NotTo(HaveOccurred())
 
-				acquired = true
+				acquired <- nil
 
-				newR = r
+				newResourceChan <- r
 			}()
 
-			runtime.Gosched()
-
-			Expect(waiting).To(BeTrue())
-			Expect(acquired).To(BeFalse())
+			<-waiting
 
 			pool.Release(r)
-			runtime.Gosched()
-			runtime.Gosched()
 
-			Expect(pool.numResources).To(Equal(1))
-			Expect(pool.idleResources.Size()).To(Equal(0))
-			Expect(active).To(Equal(1))
+			Eventually(pool.NumResources).Should(Equal(1))
+			Eventually(pool.NumIdleResources).Should(Equal(0))
+			Eventually(getActive).Should(Equal(1))
 
-			Expect(acquired).To(BeTrue())
+			Eventually(acquired).Should(Receive())
 
-			pool.Release(newR)
-			runtime.Gosched()
-			runtime.Gosched()
+			var newResource Resource
+			Eventually(newResourceChan).Should(Receive(&newResource))
 
-			Expect(pool.numResources).To(Equal(1))
-			Expect(pool.idleResources.Size()).To(Equal(1))
-			Expect(active).To(Equal(1))
+			pool.Release(newResource)
+
+			Eventually(pool.NumResources).Should(Equal(1))
+			Eventually(pool.NumIdleResources).Should(Equal(1))
+			Eventually(getActive).Should(Equal(1))
+		})
+
+		It("should wait for available resource (cancel context)", func() {
+			createPool(factory, 1, 1)
+			defer closePool()
+
+			r, err := pool.Acquire(context.Background())
+			Expect(err).NotTo(HaveOccurred())
+
+			Eventually(pool.NumResources).Should(Equal(1))
+			Eventually(pool.NumIdleResources).Should(Equal(0))
+			Eventually(getActive).Should(Equal(1))
+
+			waiting := make(chan interface{}, 1)
+			acquired := make(chan interface{}, 1)
+
+			ctx, cancel := context.WithCancel(context.Background())
+
+			go func() {
+				defer GinkgoRecover()
+
+				waiting <- nil
+
+				_, err := pool.Acquire(ctx)
+				Expect(err).To(HaveOccurred())
+				Expect(err).To(Equal(context.Canceled))
+
+				acquired <- nil
+			}()
+
+			<-waiting
+
+			Eventually(pool.NumActiveWaits).Should(Equal(1))
+
+			cancel()
+
+			Eventually(acquired).Should(Receive())
+
+			Expect(pool.NumActiveWaits()).To(Equal(1))
+
+			pool.Release(r)
+
+			Eventually(pool.NumResources).Should(Equal(1))
+			Eventually(pool.NumIdleResources).Should(Equal(1))
+			Eventually(pool.NumActiveWaits).Should(Equal(0))
+		})
+
+		It("should wait for available resource (cancel context while releasing)", func() {
+			createPool(factory, 1, 1)
+			defer closePool()
+
+			r, err := pool.Acquire(context.Background())
+			Expect(err).NotTo(HaveOccurred())
+
+			Eventually(pool.NumResources).Should(Equal(1))
+			Eventually(pool.NumIdleResources).Should(Equal(0))
+			Eventually(getActive).Should(Equal(1))
+
+			waiting := make(chan interface{}, 1)
+			acquired := make(chan interface{}, 1)
+
+			ctx, cancel := context.WithCancel(context.Background())
+
+			go func() {
+				defer GinkgoRecover()
+
+				waiting <- nil
+
+				_, err := pool.Acquire(ctx)
+				Expect(err).To(HaveOccurred())
+				Expect(err).To(Equal(context.Canceled))
+
+				acquired <- nil
+			}()
+
+			<-waiting
+
+			Eventually(pool.NumActiveWaits).Should(Equal(1))
+
+			r.(*testresource).onIsClosed = func() {
+				cancel()
+			}
+
+			pool.Release(r)
+
+			Eventually(acquired).Should(Receive())
+
+			Eventually(pool.NumResources).Should(Equal(1))
+			Eventually(pool.NumIdleResources).Should(Equal(1))
+			Eventually(pool.NumActiveWaits).Should(Equal(0))
+		})
+
+		It("should wait for available resource (cancel context while releasing closed, factory fails)", func() {
+			createPool(factory, 1, 1)
+			defer closePool()
+
+			r, err := pool.Acquire(context.Background())
+			Expect(err).NotTo(HaveOccurred())
+
+			Eventually(pool.NumResources).Should(Equal(1))
+			Eventually(pool.NumIdleResources).Should(Equal(0))
+			Eventually(getActive).Should(Equal(1))
+
+			waiting := make(chan interface{}, 1)
+			acquired := make(chan interface{}, 1)
+
+			ctx, cancel := context.WithCancel(context.Background())
+
+			go func() {
+				defer GinkgoRecover()
+
+				waiting <- nil
+
+				_, err := pool.Acquire(ctx)
+				Expect(err).To(HaveOccurred())
+				Expect(err).To(Equal(context.Canceled))
+
+				acquired <- nil
+			}()
+
+			<-waiting
+
+			Eventually(pool.NumActiveWaits).Should(Equal(1))
+
+			r.Close()
+
+			currentFactory = func(ctx context.Context) (Resource, error) {
+				cancel()
+				return nil, errors.New("could not create new resource")
+			}
+
+			pool.Release(r)
+
+			Eventually(acquired).Should(Receive())
+
+			Eventually(pool.NumResources).Should(Equal(0))
+			Eventually(pool.NumIdleResources).Should(Equal(0))
+			Eventually(pool.NumActiveWaits).Should(Equal(0))
+		})
+
+		It("should wait for available resource (cancel context while releasing closed)", func() {
+			currentFactory := factory
+
+			createPool(func(ctx context.Context) (Resource, error) {
+				return currentFactory(ctx)
+			}, 1, 1)
+			defer closePool()
+
+			r, err := pool.Acquire(context.Background())
+			Expect(err).NotTo(HaveOccurred())
+
+			Eventually(pool.NumResources).Should(Equal(1))
+			Eventually(pool.NumIdleResources).Should(Equal(0))
+			Eventually(getActive).Should(Equal(1))
+
+			waiting := make(chan interface{}, 1)
+			acquired := make(chan interface{}, 1)
+
+			ctx, cancel := context.WithCancel(context.Background())
+
+			go func() {
+				defer GinkgoRecover()
+
+				waiting <- nil
+
+				_, err := pool.Acquire(ctx)
+				Expect(err).To(HaveOccurred())
+				Expect(err).To(Equal(context.Canceled))
+
+				acquired <- nil
+			}()
+
+			<-waiting
+
+			Eventually(pool.NumActiveWaits).Should(Equal(1))
+
+			r.Close()
+
+			currentFactory = func(ctx context.Context) (Resource, error) {
+				cancel()
+				return factory(ctx)
+			}
+
+			pool.Release(r)
+
+			Eventually(acquired).Should(Receive())
+
+			Eventually(pool.NumResources).Should(Equal(1))
+			Eventually(pool.NumIdleResources).Should(Equal(1))
+			Eventually(pool.NumActiveWaits).Should(Equal(0))
 		})
 
 		It("should wait for available resource and create new one", func() {
-			pool := NewResourcePool(factory, 1, 1)
-			defer closePool(pool)
+			createPool(factory, 1, 1)
+			defer closePool()
 
-			r, err := pool.Acquire()
+			r, err := pool.Acquire(context.Background())
 			Expect(err).NotTo(HaveOccurred())
 
-			Expect(pool.numResources).To(Equal(1))
-			Expect(pool.idleResources.Size()).To(Equal(0))
-			Expect(active).To(Equal(1))
-			Expect(created).To(Equal(1))
+			Eventually(pool.NumResources).Should(Equal(1))
+			Eventually(pool.NumIdleResources).Should(Equal(0))
+			Eventually(getActive).Should(Equal(1))
+			Eventually(getCreated).Should(Equal(1))
 
-			waiting := false
-			acquired := false
-			var newR Resource
+			waiting := make(chan interface{}, 1)
+			acquired := make(chan interface{}, 1)
+
+			newResourceChan := make(chan Resource)
 
 			go func() {
 				defer GinkgoRecover()
 
-				waiting = true
+				waiting <- nil
 
-				r, err := pool.Acquire()
+				r, err := pool.Acquire(context.Background())
 				Expect(err).NotTo(HaveOccurred())
 
-				acquired = true
+				acquired <- nil
 
-				newR = r
+				newResourceChan <- r
 			}()
 
-			runtime.Gosched()
-
-			Expect(waiting).To(BeTrue())
-			Expect(acquired).To(BeFalse())
+			<-waiting
 
 			r.Close()
 			pool.Release(r)
-			runtime.Gosched()
-			runtime.Gosched()
 
-			Expect(pool.numResources).To(Equal(1))
-			Expect(pool.idleResources.Size()).To(Equal(0))
-			Expect(active).To(Equal(1))
-			Expect(created).To(Equal(2))
+			Eventually(pool.NumResources).Should(Equal(1))
+			Eventually(pool.NumIdleResources).Should(Equal(0))
+			Eventually(getActive).Should(Equal(1))
+			Eventually(getCreated).Should(Equal(2))
 
-			Expect(acquired).To(BeTrue())
+			Eventually(acquired).Should(Receive())
 
-			pool.Release(newR)
-			runtime.Gosched()
-			runtime.Gosched()
+			var newResource Resource
+			Eventually(newResourceChan).Should(Receive(&newResource))
 
-			Expect(pool.numResources).To(Equal(1))
-			Expect(pool.idleResources.Size()).To(Equal(1))
-			Expect(active).To(Equal(1))
-			Expect(created).To(Equal(2))
+			pool.Release(newResource)
+
+			Eventually(pool.NumResources).Should(Equal(1))
+			Eventually(pool.NumIdleResources).Should(Equal(1))
+			Eventually(getActive).Should(Equal(1))
+			Eventually(getCreated).Should(Equal(2))
 		})
 
 		It("should wait for available resource and get error", func() {
-			factoryShouldFail := false
+			createPool(factory, 1, 1)
+			defer closePool()
 
-			myfactory := func() (Resource, error) {
-				if factoryShouldFail {
-					return nil, errors.New("could not create new resource")
-				}
-
-				return NewTestresource(), nil
-			}
-
-			pool := NewResourcePool(myfactory, 1, 1)
-			defer closePool(pool)
-
-			r, err := pool.Acquire()
+			r, err := pool.Acquire(context.Background())
 			Expect(err).NotTo(HaveOccurred())
 
-			Expect(pool.numResources).To(Equal(1))
-			Expect(pool.idleResources.Size()).To(Equal(0))
-			Expect(active).To(Equal(1))
-			Expect(created).To(Equal(1))
+			Eventually(pool.NumResources).Should(Equal(1))
+			Eventually(pool.NumIdleResources).Should(Equal(0))
+			Eventually(getActive).Should(Equal(1))
+			Eventually(getCreated).Should(Equal(1))
 
-			waiting := false
-			acquired := false
+			waiting := make(chan interface{}, 1)
+			acquired := make(chan interface{}, 1)
 
 			go func() {
 				defer GinkgoRecover()
 
-				waiting = true
+				waiting <- nil
 
-				_, err := pool.Acquire()
+				_, err := pool.Acquire(context.Background())
 				Expect(err).To(HaveOccurred())
 
-				acquired = true
+				acquired <- nil
 			}()
 
-			runtime.Gosched()
+			<-waiting
 
-			Expect(waiting).To(BeTrue())
-			Expect(acquired).To(BeFalse())
-
-			factoryShouldFail = true
+			currentFactory = func(context.Context) (Resource, error) {
+				return nil, errors.New("could not create new resource")
+			}
 
 			r.Close()
 			pool.Release(r)
-			runtime.Gosched()
-			runtime.Gosched()
 
-			Expect(pool.numResources).To(Equal(0))
-			Expect(pool.idleResources.Size()).To(Equal(0))
-			Expect(active).To(Equal(0))
-			Expect(created).To(Equal(1))
+			Eventually(pool.NumResources).Should(Equal(0))
+			Eventually(pool.NumIdleResources).Should(Equal(0))
+			Eventually(getActive).Should(Equal(0))
+			Eventually(getCreated).Should(Equal(1))
 
-			Expect(acquired).To(BeTrue())
+			Eventually(acquired).Should(Receive())
 		})
 
 		It("should wait for available resource and get closed pool error", func() {
-			pool := NewResourcePool(factory, 1, 1)
+			createPool(factory, 1, 1)
 
-			r, err := pool.Acquire()
+			r, err := pool.Acquire(context.Background())
 			Expect(err).NotTo(HaveOccurred())
 
-			Expect(pool.numResources).To(Equal(1))
-			Expect(pool.idleResources.Size()).To(Equal(0))
-			Expect(active).To(Equal(1))
-			Expect(created).To(Equal(1))
+			Eventually(pool.NumResources).Should(Equal(1))
+			Eventually(pool.NumIdleResources).Should(Equal(0))
+			Eventually(getActive).Should(Equal(1))
+			Eventually(getCreated).Should(Equal(1))
 
-			waiting := false
-			acquired := false
+			waiting := make(chan interface{}, 1)
+			acquired := make(chan interface{}, 1)
 
 			go func() {
 				defer GinkgoRecover()
 
-				waiting = true
+				waiting <- nil
 
-				_, err := pool.Acquire()
+				_, err := pool.Acquire(context.Background())
 				Expect(err).To(HaveOccurred())
+				Expect(err).To(Equal(ErrPoolClosed))
 
-				acquired = true
+				acquired <- nil
 			}()
 
-			runtime.Gosched()
+			<-waiting
 
-			Expect(waiting).To(BeTrue())
-			Expect(acquired).To(BeFalse())
+			Eventually(pool.NumActiveWaits).Should(Equal(1))
 
-			Expect(pool.activeWaits).To(HaveLen(1))
+			Expect(acquired).NotTo(Receive())
 
 			pool.Close()
-			runtime.Gosched()
 
-			Expect(pool.activeWaits).To(HaveLen(0))
+			Eventually(pool.NumActiveWaits).Should(Equal(0))
 
-			Expect(pool.numResources).To(Equal(1))
-			Expect(pool.idleResources.Size()).To(Equal(0))
-			Expect(active).To(Equal(1))
-			Expect(created).To(Equal(1))
+			Eventually(pool.NumResources).Should(Equal(1))
+			Eventually(pool.NumIdleResources).Should(Equal(0))
+			Eventually(getActive).Should(Equal(1))
+			Eventually(getCreated).Should(Equal(1))
 
 			pool.Release(r)
-			runtime.Gosched()
-			runtime.Gosched()
 
-			Expect(acquired).To(BeTrue())
+			Eventually(acquired).Should(Receive())
 
-			Expect(pool.numResources).To(Equal(0))
-			Expect(pool.idleResources.Size()).To(Equal(0))
-			Expect(active).To(Equal(0))
+			Eventually(pool.NumResources).Should(Equal(0))
+			Eventually(pool.NumIdleResources).Should(Equal(0))
+			Eventually(getActive).Should(Equal(0))
 		})
 	})
 
 	Describe("Empty", func() {
 		It("should close only idle resources", func() {
-			pool := NewResourcePool(factory, 2, 10)
-			defer closePool(pool)
+			createPool(factory, 2, 10)
+			defer closePool()
 
-			r, err := pool.Acquire()
+			r, err := pool.Acquire(context.Background())
 			Expect(err).NotTo(HaveOccurred())
 
-			r1, err := pool.Acquire()
+			r1, err := pool.Acquire(context.Background())
 			Expect(err).NotTo(HaveOccurred())
 
 			pool.Release(r)
-			runtime.Gosched()
-			runtime.Gosched()
 
-			Expect(pool.numResources).To(Equal(2))
-			Expect(pool.idleResources.Size()).To(Equal(1))
-			Expect(active).To(Equal(2))
+			Eventually(pool.NumResources).Should(Equal(2))
+			Eventually(pool.NumIdleResources).Should(Equal(1))
+			Eventually(getActive).Should(Equal(2))
 
 			pool.Empty()
-			runtime.Gosched()
 
-			Expect(pool.numResources).To(Equal(1))
-			Expect(pool.idleResources.Size()).To(Equal(0))
-			Expect(active).To(Equal(1))
+			Eventually(pool.NumResources).Should(Equal(1))
+			Eventually(pool.NumIdleResources).Should(Equal(0))
+			Eventually(getActive).Should(Equal(1))
 
 			r1.Close()
 			pool.Release(r1)
-			runtime.Gosched()
-			runtime.Gosched()
 
-			Expect(pool.numResources).To(Equal(0))
-			Expect(pool.idleResources.Size()).To(Equal(0))
-			Expect(active).To(Equal(0))
+			Eventually(pool.NumResources).Should(Equal(0))
+			Eventually(pool.NumIdleResources).Should(Equal(0))
+			Eventually(getActive).Should(Equal(0))
 
-			r, err = pool.Acquire()
+			r, err = pool.Acquire(context.Background())
 			Expect(err).NotTo(HaveOccurred())
 
-			Expect(pool.numResources).To(Equal(1))
-			Expect(pool.idleResources.Size()).To(Equal(0))
-			Expect(active).To(Equal(1))
+			Eventually(pool.NumResources).Should(Equal(1))
+			Eventually(pool.NumIdleResources).Should(Equal(0))
+			Eventually(getActive).Should(Equal(1))
 
 			pool.Release(r)
-			runtime.Gosched()
-			runtime.Gosched()
 
-			Expect(pool.numResources).To(Equal(1))
-			Expect(pool.idleResources.Size()).To(Equal(1))
-			Expect(active).To(Equal(1))
+			Eventually(pool.NumResources).Should(Equal(1))
+			Eventually(pool.NumIdleResources).Should(Equal(1))
+			Eventually(getActive).Should(Equal(1))
+		})
+
+		It("should drain the empty channel", func() {
+			createPool(factory, 2, 10)
+			defer closePool()
+
+			r, err := pool.Acquire(context.Background())
+			Expect(err).NotTo(HaveOccurred())
+
+			pool.Release(r)
+
+			Eventually(pool.NumResources).Should(Equal(1))
+			Eventually(pool.NumIdleResources).Should(Equal(1))
+			Eventually(getActive).Should(Equal(1))
+
+			r.(*testresource).onClose = func() {
+				go pool.Empty()
+				time.Sleep(20 * time.Millisecond)
+			}
+
+			pool.Empty()
+
+			Eventually(pool.NumResources).Should(Equal(0))
+			Eventually(pool.NumIdleResources).Should(Equal(0))
+			Eventually(getActive).Should(Equal(0))
 		})
 
 		It("should not do anything if pool is closed", func() {
-			pool := NewResourcePool(factory, 2, 10)
-			defer closePool(pool)
+			createPool(factory, 2, 10)
+			defer closePool()
 
 			pool.Close()
-			runtime.Gosched()
 
 			pool.Empty()
-			runtime.Gosched()
 		})
 
 		It("should empty the pool before acquires", func() {
@@ -503,31 +787,28 @@ var _ = Describe("ResourcePool", func() {
 					created = 0
 					active = 0
 
-					pool := NewResourcePool(factory, 10, 20)
-					defer pool.Close()
+					createPool(factory, 10, 20)
+					defer closePool()
 
 					rs := make([]Resource, 10)
 
-					for i, _ := range rs {
-						r, err := pool.Acquire()
+					for i := range rs {
+						r, err := pool.Acquire(context.Background())
 						Expect(err).NotTo(HaveOccurred())
 						rs[i] = r
 					}
 
-					for i, _ := range rs {
+					for i := range rs {
 						pool.Release(rs[i])
 					}
 
-					runtime.Gosched()
-					runtime.Gosched()
-
-					Expect(pool.numResources).To(Equal(10))
-					Expect(pool.idleResources.Size()).To(Equal(10))
-					Expect(active).To(Equal(10))
-					Expect(created).To(Equal(10))
+					Eventually(pool.NumResources).Should(Equal(10))
+					Eventually(pool.NumIdleResources).Should(Equal(10))
+					Eventually(getActive).Should(Equal(10))
+					Eventually(getCreated).Should(Equal(10))
 
 					for i := 0; i < 10; i++ {
-						r, err := pool.Acquire()
+						r, err := pool.Acquire(context.Background())
 						Expect(err).NotTo(HaveOccurred())
 
 						r.Close()
@@ -537,15 +818,14 @@ var _ = Describe("ResourcePool", func() {
 						pool.Empty()
 					}
 
-					Expect(active).To(Equal(0))
-					Expect(created).To(Equal(19))
+					Eventually(getActive).Should(Equal(0))
+					Eventually(getCreated).Should(Equal(19))
 
 					pool.Empty()
-					runtime.Gosched()
 
-					Expect(pool.numResources).To(Equal(0))
-					Expect(pool.idleResources.Size()).To(Equal(0))
-					Expect(active).To(Equal(0))
+					Eventually(pool.NumResources).Should(Equal(0))
+					Eventually(pool.NumIdleResources).Should(Equal(0))
+					Eventually(getActive).Should(Equal(0))
 				}()
 			}
 		})
@@ -553,63 +833,56 @@ var _ = Describe("ResourcePool", func() {
 
 	Describe("Close", func() {
 		It("should close idle resources and close pool", func() {
-			pool := NewResourcePool(factory, 2, 10)
+			createPool(factory, 2, 10)
 
-			r, err := pool.Acquire()
+			r, err := pool.Acquire(context.Background())
 			Expect(err).NotTo(HaveOccurred())
 
 			pool.Release(r)
-			runtime.Gosched()
-			runtime.Gosched()
 
-			Expect(pool.numResources).To(Equal(1))
-			Expect(pool.idleResources.Size()).To(Equal(1))
-			Expect(active).To(Equal(1))
+			Eventually(pool.NumResources).Should(Equal(1))
+			Eventually(pool.NumIdleResources).Should(Equal(1))
+			Eventually(getActive).Should(Equal(1))
 
 			pool.Close()
-			runtime.Gosched()
 
-			Expect(pool.numResources).To(Equal(0))
-			Expect(pool.idleResources.Size()).To(Equal(0))
-			Expect(active).To(Equal(0))
+			Eventually(pool.NumResources).Should(Equal(0))
+			Eventually(pool.NumIdleResources).Should(Equal(0))
+			Eventually(getActive).Should(Equal(0))
 
-			_, err = pool.Acquire()
-			Expect(err == PoolClosed).To(BeTrue())
+			_, err = pool.Acquire(context.Background())
+			Expect(err).To(Equal(ErrPoolClosed))
 		})
 
 		It("should be idempotent", func() {
-			pool := NewResourcePool(factory, 2, 10)
+			createPool(factory, 2, 10)
 
-			r, err := pool.Acquire()
+			r, err := pool.Acquire(context.Background())
 			Expect(err).NotTo(HaveOccurred())
 
 			pool.Release(r)
-			runtime.Gosched()
-			runtime.Gosched()
 
-			Expect(pool.numResources).To(Equal(1))
-			Expect(pool.idleResources.Size()).To(Equal(1))
-			Expect(active).To(Equal(1))
+			Eventually(pool.NumResources).Should(Equal(1))
+			Eventually(pool.NumIdleResources).Should(Equal(1))
+			Eventually(getActive).Should(Equal(1))
 
 			pool.Close()
-			runtime.Gosched()
 
-			Expect(pool.numResources).To(Equal(0))
-			Expect(pool.idleResources.Size()).To(Equal(0))
-			Expect(active).To(Equal(0))
+			Eventually(pool.NumResources).Should(Equal(0))
+			Eventually(pool.NumIdleResources).Should(Equal(0))
+			Eventually(getActive).Should(Equal(0))
 
-			_, err = pool.Acquire()
-			Expect(err == PoolClosed).To(BeTrue())
+			_, err = pool.Acquire(context.Background())
+			Expect(err).To(Equal(ErrPoolClosed))
 
 			pool.Close()
-			runtime.Gosched()
 		})
 	})
 
 	Describe("NumResources", func() {
 		It("should return the number of resources known at this time", func() {
-			pool := NewResourcePool(factory, 2, 10)
-			defer closePool(pool)
+			createPool(factory, 2, 10)
+			defer closePool()
 
 			Expect(pool.NumResources()).To(Equal(0))
 		})
